@@ -448,24 +448,142 @@ def _fetch_news_miaoxiang(query: str) -> Optional[List[Dict]]:
         return None
 
 
+def _fetch_history_tickflow(code: str, days: int = 120) -> Optional[List[Dict]]:
+    """TickFlow K线数据"""
+    try:
+        from tickflow import TickFlow
+        from datetime import datetime
+        import os
+        api_key = os.environ.get("TICKFLOW_API_KEY", "")
+        if not api_key:
+            return None
+        # Determine symbol suffix
+        code_upper = code.upper()
+        if code_upper.startswith("HK"):
+            symbol = code_upper
+        elif code.isdigit() and len(code) == 6:
+            symbol = f"{code}.{'SH' if code.startswith(('60','68')) else 'SZ'}"
+        else:
+            symbol = code
+        tf = TickFlow(api_key=api_key, timeout=10)
+        r = tf.klines.get(symbol=symbol, period="1d", count=days)
+        if not r or not r.get("timestamp"):
+            return None
+        records = []
+        n = len(r["timestamp"])
+        for i in range(n):
+            ts = r["timestamp"][i]
+            if isinstance(ts, (int, float)):
+                ts = datetime.fromtimestamp(ts / 1000).strftime("%Y-%m-%d")
+            records.append({
+                "date": str(ts)[:10],
+                "open": float(r["open"][i]) if i < len(r.get("open", [])) else 0,
+                "high": float(r["high"][i]) if i < len(r.get("high", [])) else 0,
+                "low": float(r["low"][i]) if i < len(r.get("low", [])) else 0,
+                "close": float(r["close"][i]) if i < len(r.get("close", [])) else 0,
+                "volume": float(r["volume"][i]) if i < len(r.get("volume", [])) else 0,
+                "amount": float(r["amount"][i]) if i < len(r.get("amount", [])) else 0,
+                "pct_chg": 0,
+            })
+        return records
+    except Exception as e:
+        logger.debug(f"tickflow history failed: {e}")
+        return None
+
+
+def _ths_code(code: str) -> str:
+    """Convert 6-digit code to THSCODE format"""
+    cu = code.upper()
+    if cu.startswith("HK"):
+        return f"UHKG{cu[2:]}"
+    if code.isdigit() and len(code) == 6:
+        return f"USHA{code}" if code.startswith(("60", "68")) else f"USZA{code}"
+    return code
+
+
+def _fetch_quote_ths(code: str) -> Optional[Dict]:
+    """同花顺 THS 实时行情（游客模式，免费）"""
+    try:
+        from thsdk import THS
+        thscode = _ths_code(code)
+        with THS() as ths:
+            r = ths.market_data_cn(thscode)
+            if not r.data:
+                return None
+            d = r.data[0]
+            price = d.get("价格")
+            prev = d.get("昨收价")
+            chg = None
+            if price and prev and prev > 0:
+                chg = round((price - prev) / prev * 100, 2)
+            return {
+                "code": code,
+                "name": d.get("名称", ""),
+                "price": price,
+                "pre_close": prev,
+                "open": d.get("开盘价"),
+                "high": d.get("最高价"),
+                "low": d.get("最低价"),
+                "volume": d.get("成交量"),
+                "amount": d.get("总金额"),
+                "change_pct": chg,
+                "source": "ths",
+            }
+    except Exception as e:
+        logger.debug(f"ths quote failed: {e}")
+        return None
+
+
+def _fetch_history_ths(code: str, days: int = 120) -> Optional[List[Dict]]:
+    """同花顺 THS 日K线（游客模式，免费）"""
+    try:
+        from thsdk import THS
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+        thscode = _ths_code(code)
+        with THS() as ths:
+            r = ths.klines(thscode, interval="day", count=days)
+            if not r.data:
+                return None
+            records = []
+            for k in r.data:
+                records.append({
+                    "date": str(k.get("time", ""))[:10],
+                    "open": float(k.get("open", 0)),
+                    "high": float(k.get("high", 0)),
+                    "low": float(k.get("low", 0)),
+                    "close": float(k.get("close", 0)),
+                    "volume": float(k.get("volume", 0)),
+                    "amount": float(k.get("amount", 0)),
+                    "pct_chg": 0,
+                })
+            return records
+    except Exception as e:
+        logger.debug(f"ths history failed: {e}")
+        return None
+
+
 # ============================================================
 # 数据源注册表
 # ============================================================
 
 QUOTE_SOURCES: List[DataSource] = [
-    DataSource("tickflow", 0, _fetch_quote_tickflow, ["cn"]),      # P0: 付费API
-    DataSource("miaoxiang", 0, _fetch_quote_miaoxiang, ["cn"]),    # P0: 东方财富官方
-    DataSource("sina", 1, _fetch_quote_sina, ["cn"]),
-    DataSource("efinance", 2, _fetch_quote_efinance, ["cn"]),
-    DataSource("akshare", 3, _fetch_quote_akshare, ["cn"]),
-    DataSource("yfinance", 4, _fetch_quote_yfinance, ["cn", "hk", "us"]),
+    DataSource("tickflow", 0, _fetch_quote_tickflow, ["cn"]),      # P0: 付费API (行情+日线)
+    DataSource("miaoxiang", 0, _fetch_quote_miaoxiang, ["cn"]),    # P0: 东财官方 (行情+资讯)
+    DataSource("ths", 1, _fetch_quote_ths, ["cn"]),                # P1: 同花顺游客 (行情+日线)
+    DataSource("sina", 2, _fetch_quote_sina, ["cn"]),
+    DataSource("efinance", 3, _fetch_quote_efinance, ["cn"]),
+    DataSource("akshare", 4, _fetch_quote_akshare, ["cn"]),
+    DataSource("yfinance", 5, _fetch_quote_yfinance, ["cn", "hk", "us"]),
 ]
 
 HISTORY_SOURCES: List[DataSource] = [
-    DataSource("sohu", 0, _fetch_history_sohu, ["cn"]),
-    DataSource("efinance", 1, _fetch_history_efinance, ["cn"]),
-    DataSource("akshare", 2, _fetch_history_akshare, ["cn"]),
-    DataSource("yfinance", 3, _fetch_history_yfinance, ["cn", "hk", "us"]),
+    DataSource("tickflow", 0, _fetch_history_tickflow, ["cn"]),    # P0: TickFlow K线
+    DataSource("ths", 1, _fetch_history_ths, ["cn"]),              # P1: 同花顺游客
+    DataSource("sohu", 2, _fetch_history_sohu, ["cn"]),            # P2: 纯HTTP免费
+    DataSource("efinance", 3, _fetch_history_efinance, ["cn"]),
+    DataSource("akshare", 4, _fetch_history_akshare, ["cn"]),
+    DataSource("yfinance", 5, _fetch_history_yfinance, ["cn", "hk", "us"]),
 ]
 
 
@@ -477,6 +595,7 @@ HISTORY_SOURCES: List[DataSource] = [
 FETCH_TIMEOUTS = {
     "tickflow": 3,
     "miaoxiang": 4,
+    "ths": 8,
     "sohu": 3,
     "sina": 4,
     "efinance": 5,
