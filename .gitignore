@@ -87,3 +87,12 @@ static/
 /apps/dsa-desktop/dist/
 /apps/dsa-desktop/node_modules/
 docs/specs/
+
+# DSA CLI additions
+.venv/
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+pyproject.toml.bak
+pyproject-dsa.toml
