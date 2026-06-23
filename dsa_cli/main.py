@@ -362,6 +362,20 @@ def source_status(ctx):
     _output({"sources": status}, as_json)
 
 
+@cli.command("search-news")
+@click.argument("query")
+@click.pass_context
+def search_news(ctx, query):
+    """搜索金融资讯（东方财富妙想）"""
+    as_json = ctx.obj["json"]
+    from dsa_cli.multi_fetcher import _fetch_news_miaoxiang
+    results = _fetch_news_miaoxiang(query)
+    if results:
+        _output({"query": query, "count": len(results), "results": results}, as_json)
+    else:
+        _output({"query": query, "error": "无结果" if results is not None else "API 不可用（需 MX_APIKEY）"}, as_json)
+
+
 @cli.command()
 @click.argument("market", default="sh")
 @click.pass_context

@@ -349,12 +349,112 @@ def _fetch_quote_tickflow(code: str) -> Optional[Dict]:
         return None
 
 
+def _fetch_quote_miaoxiang(code: str) -> Optional[Dict]:
+    """妙想金融数据 API（东方财富官方，自然语言查询）"""
+    try:
+        import requests, json, os
+        api_key = os.environ.get("MX_APIKEY", "")
+        if not api_key:
+            return None
+        url = "https://mkapi2.dfcfs.com/finskillshub/api/claw/query"
+        resp = requests.post(url,
+            headers={"Content-Type": "application/json", "apikey": api_key},
+            json={"toolQuery": f"股票{code}最新价 涨跌幅 最高价 最低价 开盘价 成交量 成交额 换手率"},
+            timeout=8)
+        if resp.status_code != 200:
+            return None
+        r = resp.json()
+        if r.get("status") != 0:
+            return None
+        # Parse the structured response
+        data = r.get("data", {}).get("data", {}).get("searchDataResultDTO", {})
+        dto_list = data.get("dataTableDTOList", [])
+        if not dto_list:
+            return None
+        dto = dto_list[0]
+        table = dto.get("table", {})
+        name_map = dto.get("nameMap", {})
+        entity = dto.get("entityName", "")
+        # Extract name from entity like "贵州茅台(600519.SH)"
+        stock_name = entity.split("(")[0] if "(" in entity else entity
+        # Build indicator map: label -> value
+        indicators = {}
+        for key, values in table.items():
+            if key == "headName":
+                continue
+            label = name_map.get(str(key), key)
+            val = values[-1] if isinstance(values, list) and values else values
+            try:
+                val = float(val)
+            except (ValueError, TypeError):
+                pass
+            indicators[label] = val
+        price = indicators.get("最新价")
+        prev = indicators.get("昨收") or indicators.get("前收盘")
+        chg = indicators.get("涨跌幅")
+        if chg and isinstance(chg, str) and chg.endswith("%"):
+            chg = float(chg.replace("%", ""))
+        return {
+            "code": code,
+            "name": stock_name,
+            "price": price,
+            "pre_close": prev,
+            "open": indicators.get("开盘价") or indicators.get("今开"),
+            "high": indicators.get("最高价") or indicators.get("最高"),
+            "low": indicators.get("最低价") or indicators.get("最低"),
+            "volume": indicators.get("成交量"),
+            "amount": indicators.get("成交额"),
+            "change_pct": chg,
+            "turnover_rate": indicators.get("换手率"),
+            "source": "miaoxiang",
+        }
+    except Exception as e:
+        logger.debug(f"miaoxiang quote failed: {e}")
+        return None
+
+
+def _fetch_news_miaoxiang(query: str) -> Optional[List[Dict]]:
+    """妙想资讯搜索（东方财富官方金融搜索）"""
+    try:
+        import requests, os
+        api_key = os.environ.get("MX_APIKEY", "")
+        if not api_key:
+            return None
+        url = "https://mkapi2.dfcfs.com/finskillshub/api/claw/news-search"
+        resp = requests.post(url,
+            headers={"Content-Type": "application/json", "apikey": api_key},
+            json={"query": query},
+            timeout=8)
+        if resp.status_code != 200:
+            return None
+        r = resp.json()
+        if r.get("status") != 0:
+            return None
+        items = r.get("data", {}).get("data", {}).get("llmSearchResponse", {}).get("data", [])
+        return [
+            {
+                "title": i.get("title", ""),
+                "content": i.get("content", "")[:500],
+                "source": i.get("insName", ""),
+                "date": i.get("date", ""),
+                "type": i.get("informationType", ""),
+                "rating": i.get("rating", ""),
+                "entity": i.get("entityFullName", ""),
+            }
+            for i in items
+        ][:10]
+    except Exception as e:
+        logger.debug(f"miaoxiang search failed: {e}")
+        return None
+
+
 # ============================================================
 # 数据源注册表
 # ============================================================
 
 QUOTE_SOURCES: List[DataSource] = [
-    DataSource("tickflow", 0, _fetch_quote_tickflow, ["cn"]),    # P0: 付费源最快
+    DataSource("tickflow", 0, _fetch_quote_tickflow, ["cn"]),      # P0: 付费API
+    DataSource("miaoxiang", 0, _fetch_quote_miaoxiang, ["cn"]),    # P0: 东方财富官方
     DataSource("sina", 1, _fetch_quote_sina, ["cn"]),
     DataSource("efinance", 2, _fetch_quote_efinance, ["cn"]),
     DataSource("akshare", 3, _fetch_quote_akshare, ["cn"]),
@@ -376,6 +476,7 @@ HISTORY_SOURCES: List[DataSource] = [
 # 每源超时配置
 FETCH_TIMEOUTS = {
     "tickflow": 3,
+    "miaoxiang": 4,
     "sohu": 3,
     "sina": 4,
     "efinance": 5,
