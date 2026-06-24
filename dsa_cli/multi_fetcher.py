@@ -13,6 +13,11 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional, Dict, Any, List, Callable
 
+from dotenv import load_dotenv, find_dotenv
+_dotenv_path = find_dotenv(usecwd=True)
+if _dotenv_path:
+    load_dotenv(dotenv_path=_dotenv_path, override=True)  # 自动加载项目根目录 .env 中的 API Key 等配置
+
 logger = logging.getLogger(__name__)
 
 
@@ -125,8 +130,48 @@ def _fetch_quote_akshare(code: str) -> Optional[Dict]:
         return None
 
 
+def _fetch_quote_eastmoney(code: str) -> Optional[Dict]:
+    """东方财富 push2 实时行情（免费、低延迟、无需 API Key）"""
+    try:
+        import urllib.request, json
+        if code.startswith("HK"):
+            market_id = "116"
+        elif code.isdigit() and len(code) == 6:
+            market_id = "1" if code.startswith(("60", "68")) else "0"
+        else:
+            market_id = "1"
+        url = f"https://push2.eastmoney.com/api/qt/stock/get?secid={market_id}.{code}&fields=f43,f44,f45,f46,f47,f48,f57,f58,f60,f170"
+        req = urllib.request.Request(url, headers={
+            "User-Agent": "Mozilla/5.0",
+            "Referer": "https://quote.eastmoney.com/",
+        })
+        resp = urllib.request.urlopen(req, timeout=6)
+        d = json.loads(resp.read()).get("data")
+        if not d or d.get("f43") is None:
+            return None
+        price = d["f43"] / 100
+        prev = d.get("f60", 0) / 100
+        chg = round((price - prev) / prev * 100, 2) if prev else None
+        return {
+            "code": code,
+            "name": d.get("f58", ""),
+            "price": price,
+            "pre_close": prev,
+            "open": d.get("f46", 0) / 100,
+            "high": d.get("f44", 0) / 100,
+            "low": d.get("f45", 0) / 100,
+            "volume": d.get("f47"),
+            "amount": d.get("f48"),
+            "change_pct": chg,
+            "source": "eastmoney",
+        }
+    except Exception as e:
+        logger.debug(f"eastmoney quote failed: {e}")
+        return None
+
+
 def _fetch_quote_yfinance(code: str) -> Optional[Dict]:
-    """yfinance 美股/港股"""
+    """yfinance 美股/港股（A股已由 eastmoney 覆盖，仅作 HK/US 后备）"""
     try:
         import yfinance as yf
         market_map = {"cn": ".SS", "hk": ".HK", "us": ""}
@@ -663,12 +708,13 @@ def _fetch_history_ths(code: str, days: int = 120) -> Optional[List[Dict]]:
 # ============================================================
 
 QUOTE_SOURCES: List[DataSource] = [
-    DataSource("tickflow", 0, _fetch_quote_tickflow, ["cn"]),      # P0: 最优 (前复权+行情+日线)
-    DataSource("miaoxiang", 1, _fetch_quote_miaoxiang, ["cn"]),    # P1: 东财官方 (行情+资讯)
+    DataSource("tickflow", 0, _fetch_quote_tickflow, ["cn"]),      # P0: 付费最优
+    DataSource("eastmoney", 0, _fetch_quote_eastmoney, ["cn"]),    # P0: 东方财富免费实时（并行抢答）
+    DataSource("miaoxiang", 1, _fetch_quote_miaoxiang, ["cn"]),    # P1: 东财官方
     DataSource("sina", 2, _fetch_quote_sina, ["cn"]),
     DataSource("efinance", 3, _fetch_quote_efinance, ["cn"]),
     DataSource("akshare", 4, _fetch_quote_akshare, ["cn"]),
-    DataSource("yfinance", 5, _fetch_quote_yfinance, ["cn", "hk", "us"]),
+    DataSource("yfinance", 99, _fetch_quote_yfinance, ["hk", "us"]),  # 仅港股美股后备
 ]
 
 HISTORY_SOURCES: List[DataSource] = [
@@ -676,7 +722,7 @@ HISTORY_SOURCES: List[DataSource] = [
     DataSource("sohu", 1, _fetch_history_sohu, ["cn"]),            # P1: 纯HTTP免费
     DataSource("efinance", 2, _fetch_history_efinance, ["cn"]),
     DataSource("akshare", 3, _fetch_history_akshare, ["cn"]),
-    DataSource("yfinance", 4, _fetch_history_yfinance, ["cn", "hk", "us"]),
+    DataSource("yfinance", 99, _fetch_history_yfinance, ["hk", "us"]),  # 仅港股美股后备
 ]
 
 
@@ -687,6 +733,7 @@ HISTORY_SOURCES: List[DataSource] = [
 # 每源超时配置
 FETCH_TIMEOUTS = {
     "tickflow": 3,
+    "eastmoney": 3,
     "miaoxiang": 4,
     "sohu": 3,
     "sina": 4,
