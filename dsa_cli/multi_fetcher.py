@@ -534,8 +534,90 @@ def _fetch_quote_ths(code: str) -> Optional[Dict]:
         return None
 
 
+def _forward_adjust(records: List[Dict], threshold: float = 0.15) -> List[Dict]:
+    """
+    前复权处理：检测除权除息缺口，将历史价格按复权因子调整。
+
+    THS 返回的是不复权数据，除权日前后会出现价格断层（通常>15%）。
+    扫描相邻两日，用 (除权日开盘价 / 前日收盘价) 作为复权因子，
+    将除权日**之前**的价格按累计因子缩放，使历史价格与最新价可比。
+
+    Args:
+        records: 历史K线列表（最新在前，THS默认顺序）
+        threshold: 前收→今开变化率阈值，默认 0.15 (15%)
+
+    Returns:
+        前复权后的K线列表（保持原顺序）
+    """
+    if not records or len(records) < 2:
+        return records
+
+    # 转为日期升序（旧→新），深拷贝避免修改原数据
+    import copy
+    sorted_recs = sorted(copy.deepcopy(records), key=lambda r: r["date"])
+    n = len(sorted_recs)
+
+    # 找出所有除权断点：index=断点位置（新数据起始），factor=本次除权因子
+    # 累计因子从最早到最新累积
+    breakpoints = []  # [(break_index, single_factor, cumulative_factor), ...]
+    cum_factor = 1.0
+
+    for i in range(1, n):
+        prev_close = sorted_recs[i - 1]["close"]
+        curr_open = sorted_recs[i]["open"]
+        if prev_close <= 0 or curr_open <= 0:
+            continue
+
+        gap = abs(curr_open - prev_close) / prev_close
+        if gap > threshold:
+            single_factor = curr_open / prev_close
+            cum_factor *= single_factor
+            breakpoints.append((i, single_factor, cum_factor))
+            logger.info(
+                f"[前复权] 检测到除权: {sorted_recs[i-1]['date']}→{sorted_recs[i]['date']} "
+                f"前收={prev_close:.2f} 今开={curr_open:.2f} "
+                f"因子={single_factor:.4f} 累计={cum_factor:.4f}"
+            )
+
+    if not breakpoints:
+        return records  # 无除权，原样返回
+
+    # 应用复权：
+    # 每个除权断点之后的单因子独立，历史数据需要的是"从此断点之后所有因子之积"
+    # 从最后往前回溯：当前累计 = 1.0，每遇到一个断点就乘上该断点因子
+    # 段 = 断点k-1..断点k（开区间），用 当前累计 调整
+    segment_factor = 1.0
+    prev_idx = n  # 从最新端开始
+    for break_i, single_factor, _ in reversed(breakpoints):
+        # 当前段 = [break_i, prev_idx)，用 segment_factor 调整
+        for j in range(break_i, prev_idx):
+            rec = sorted_recs[j]
+            rec["open"] = round(rec["open"] * segment_factor, 2)
+            rec["high"] = round(rec["high"] * segment_factor, 2)
+            rec["low"] = round(rec["low"] * segment_factor, 2)
+            rec["close"] = round(rec["close"] * segment_factor, 2)
+        segment_factor *= single_factor
+        prev_idx = break_i
+
+    # 最后一段：最旧的数据用最终累计因子
+    for j in range(0, prev_idx):
+        rec = sorted_recs[j]
+        rec["open"] = round(rec["open"] * segment_factor, 2)
+        rec["high"] = round(rec["high"] * segment_factor, 2)
+        rec["low"] = round(rec["low"] * segment_factor, 2)
+        rec["close"] = round(rec["close"] * segment_factor, 2)
+
+    logger.info(
+        f"[前复权] 完成: {len(breakpoints)} 个除权点, "
+        f"调整了 {breakpoints[-1][0]} 条历史记录"
+    )
+
+    # 返回原顺序（最新在前）
+    return sorted(sorted_recs, key=lambda r: r["date"], reverse=True)
+
+
 def _fetch_history_ths(code: str, days: int = 120) -> Optional[List[Dict]]:
-    """同花顺 THS 日K线（游客模式，免费）"""
+    """同花顺 THS 日K线（游客模式，免费）。自动前复权处理。"""
     try:
         from thsdk import THS
         from datetime import datetime
@@ -547,16 +629,29 @@ def _fetch_history_ths(code: str, days: int = 120) -> Optional[List[Dict]]:
                 return None
             records = []
             for k in r.data:
+                # thsdk 1.7.x 返回中文键名；兼容处理
+                def _get(key_en, key_cn, default=None):
+                    val = k.get(key_en) or k.get(key_cn)
+                    return val if val is not None else default
+                date_val = _get("time", "时间", "")
+                if date_val is None:
+                    date_val = ""
+                if hasattr(date_val, 'strftime'):
+                    date_val = date_val.strftime("%Y-%m-%d")
+                else:
+                    date_val = str(date_val)[:10]
                 records.append({
-                    "date": str(k.get("time", ""))[:10],
-                    "open": float(k.get("open", 0)),
-                    "high": float(k.get("high", 0)),
-                    "low": float(k.get("low", 0)),
-                    "close": float(k.get("close", 0)),
-                    "volume": float(k.get("volume", 0)),
-                    "amount": float(k.get("amount", 0)),
+                    "date": date_val,
+                    "open": float(_get("open", "开盘价", 0)),
+                    "high": float(_get("high", "最高价", 0)),
+                    "low": float(_get("low", "最低价", 0)),
+                    "close": float(_get("close", "收盘价", 0)),
+                    "volume": float(_get("volume", "成交量", 0)) / 100,  # 股→手
+                    "amount": float(_get("amount", "总金额", 0)) / 100,  # 分→元？
                     "pct_chg": 0,
                 })
+            # 前复权处理：将历史价格调整到最新价基准
+            records = _forward_adjust(records)
             return records
     except Exception as e:
         logger.debug(f"ths history failed: {e}")
@@ -568,9 +663,8 @@ def _fetch_history_ths(code: str, days: int = 120) -> Optional[List[Dict]]:
 # ============================================================
 
 QUOTE_SOURCES: List[DataSource] = [
-    DataSource("tickflow", 0, _fetch_quote_tickflow, ["cn"]),      # P0: 付费API (行情+日线)
-    DataSource("miaoxiang", 0, _fetch_quote_miaoxiang, ["cn"]),    # P0: 东财官方 (行情+资讯)
-    DataSource("ths", 1, _fetch_quote_ths, ["cn"]),                # P1: 同花顺游客 (行情+日线)
+    DataSource("tickflow", 0, _fetch_quote_tickflow, ["cn"]),      # P0: 最优 (前复权+行情+日线)
+    DataSource("miaoxiang", 1, _fetch_quote_miaoxiang, ["cn"]),    # P1: 东财官方 (行情+资讯)
     DataSource("sina", 2, _fetch_quote_sina, ["cn"]),
     DataSource("efinance", 3, _fetch_quote_efinance, ["cn"]),
     DataSource("akshare", 4, _fetch_quote_akshare, ["cn"]),
@@ -578,12 +672,11 @@ QUOTE_SOURCES: List[DataSource] = [
 ]
 
 HISTORY_SOURCES: List[DataSource] = [
-    DataSource("tickflow", 0, _fetch_history_tickflow, ["cn"]),    # P0: TickFlow K线
-    DataSource("ths", 1, _fetch_history_ths, ["cn"]),              # P1: 同花顺游客
-    DataSource("sohu", 2, _fetch_history_sohu, ["cn"]),            # P2: 纯HTTP免费
-    DataSource("efinance", 3, _fetch_history_efinance, ["cn"]),
-    DataSource("akshare", 4, _fetch_history_akshare, ["cn"]),
-    DataSource("yfinance", 5, _fetch_history_yfinance, ["cn", "hk", "us"]),
+    DataSource("tickflow", 0, _fetch_history_tickflow, ["cn"]),    # P0: 最优 (前复权)
+    DataSource("sohu", 1, _fetch_history_sohu, ["cn"]),            # P1: 纯HTTP免费
+    DataSource("efinance", 2, _fetch_history_efinance, ["cn"]),
+    DataSource("akshare", 3, _fetch_history_akshare, ["cn"]),
+    DataSource("yfinance", 4, _fetch_history_yfinance, ["cn", "hk", "us"]),
 ]
 
 
@@ -595,7 +688,6 @@ HISTORY_SOURCES: List[DataSource] = [
 FETCH_TIMEOUTS = {
     "tickflow": 3,
     "miaoxiang": 4,
-    "ths": 8,
     "sohu": 3,
     "sina": 4,
     "efinance": 5,
